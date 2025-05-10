@@ -16,6 +16,7 @@ const authRoutes = require('./routes/authRoutes');
 const githubRoutes = require('./routes/githubRoutes');
 const reviewRoutes = require('./routes/reviewRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const pullRequestRoutes = require('./routes/pullRequestRoutes');
 
 // Create Express app
 const app = express();
@@ -55,6 +56,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/github', githubRoutes);
 app.use('/review', reviewRoutes);
 app.use('/notifications', notificationRoutes);
+app.use('/api/pull-requests', pullRequestRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
