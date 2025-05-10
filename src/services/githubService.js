@@ -1,3 +1,4 @@
+// githubService.js - Enhanced GitHub service for better comment posting
 const axios = require("axios");
 const NodeCache = require("node-cache");
 const crypto = require("crypto");
@@ -33,6 +34,160 @@ class GitHubService {
     token = await getInstallationToken(installationId);
     tokenCache.set(cacheKey, token);
     return token;
+  }
+
+  async createReviewWithComments(
+    installationId,
+    owner,
+    repo,
+    prNumber,
+    comments,
+    commitSha
+  ) {
+    try {
+      const client = await this.getApiClient(installationId);
+
+      // Use line-based comments instead of position-based
+      try {
+        const reviewData = {
+          commit_id: commitSha,
+          body: "## 🤖 AI Code Review\n\nI've analyzed your pull request. Here are my findings:",
+          event: "COMMENT",
+          comments: comments.map((comment) => ({
+            path: comment.path,
+            line: comment.line, // Use line number directly
+            side: "RIGHT", // Comment on the new version
+            body: comment.body,
+          })),
+        };
+
+        const response = await client.post(
+          `/repos/${owner}/${repo}/pulls/${prNumber}/reviews`,
+          reviewData
+        );
+
+        logger.info(`Successfully posted ${comments.length} review comments`);
+        return { success: comments.length, failed: 0 };
+      } catch (reviewError) {
+        logger.warn(
+          "Failed to create review with line-based comments, trying fallback",
+          {
+            error: reviewError.response?.data || reviewError.message,
+          }
+        );
+
+        // Fallback to individual comments
+        return await this.postCommentsIndividually(
+          client,
+          owner,
+          repo,
+          prNumber,
+          comments,
+          commitSha
+        );
+      }
+    } catch (error) {
+      logger.error("Error in createReviewWithComments", {
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Post comments individually as fallback
+   */
+  async postCommentsIndividually(
+    client,
+    owner,
+    repo,
+    prNumber,
+    comments,
+    commitSha
+  ) {
+    let successCount = 0;
+    let failedCount = 0;
+    const failedComments = [];
+
+    for (const comment of comments) {
+      try {
+        // Try as review comment first
+        await client.post(
+          `/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
+          {
+            body: comment.body,
+            commit_id: commitSha,
+            path: comment.path,
+            position: comment.position,
+          }
+        );
+        successCount++;
+      } catch (commentError) {
+        // If position-based comment fails, try line-based
+        try {
+          await client.post(
+            `/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
+            {
+              body: comment.body,
+              commit_id: commitSha,
+              path: comment.path,
+              line: comment.line, // Use line number instead
+              side: "RIGHT",
+            }
+          );
+          successCount++;
+        } catch (lineError) {
+          // Final fallback: post as issue comment
+          try {
+            await this.addComment(
+              client.defaults.headers.Authorization.split(" ")[1],
+              owner,
+              repo,
+              prNumber,
+              `**${comment.path}** (Line ${comment.line})\n${comment.body}`
+            );
+            successCount++;
+          } catch (issueError) {
+            failedCount++;
+            failedComments.push({
+              path: comment.path,
+              line: comment.line,
+              error: issueError.message,
+            });
+          }
+        }
+      }
+    }
+
+    if (failedCount > 0) {
+      logger.warn(`Failed to post ${failedCount} comments`, { failedComments });
+    }
+
+    return { success: successCount, failed: failedCount };
+  }
+
+  /**
+   * Add comment to PR (issue comment)
+   */
+  async addComment(installationId, owner, repo, prNumber, body) {
+    try {
+      const client = await this.getApiClient(installationId);
+
+      const response = await client.post(
+        `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
+        { body }
+      );
+
+      return response.data;
+    } catch (error) {
+      logger.error("Error adding comment", {
+        error: error.message,
+        owner,
+        repo,
+        prNumber,
+      });
+      throw new Error(`Failed to add comment: ${error.message}`);
+    }
   }
 
   async getRepository(installationId, owner, repo) {
@@ -107,104 +262,6 @@ class GitHubService {
     }
   }
 
-  async createReview(installationId, owner, repo, prNumber, comments, commitSha) {
-    try {
-      const client = await this.getApiClient(installationId);
-      const reviewData = {
-        commit_id: commitSha,
-        body: "AI Code Review",
-        event: "COMMENT",
-        comments: comments.map(comment => ({
-          path: comment.path,
-          line: comment.line, // GitHub API should accept line numbers directly
-          body: comment.body,
-          side: "RIGHT" // Comment on the new version of the file
-        }))
-      };
-      
-      const response = await client.post(
-        `/repos/${owner}/${repo}/pulls/${prNumber}/reviews`,
-        reviewData
-      );
-      
-      return response.data;
-    } catch (error) {
-      console.error("Review failed, fallback to regular comments", error.response?.data);
-      
-      // Simple fallback: just post as regular comments
-      for (const comment of comments) {
-        await this.addComment(
-          installationId,
-          owner,
-          repo,
-          prNumber,
-          `**${comment.path}** (Line ${comment.line})\n${comment.body}`
-        );
-      }
-    }
-  }
-  
-  // Find exact position in diff for a specific line number
-  findExactPositionInDiff(patch, targetLine) {
-    const lines = patch.split('\n');
-    let position = 0;
-    let currentFileLine = 0;
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      position++;
-      
-      // Parse header to get starting line numbers
-      if (line.startsWith('@@')) {
-        const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-        if (match) {
-          currentFileLine = parseInt(match[1]) - 1;
-          continue;
-        }
-      }
-      
-      // Skip deleted lines (they don't exist in the new file)
-      if (line.startsWith('-')) {
-        continue;
-      }
-      
-      // Count added and context lines
-      if (line.startsWith('+') || line.startsWith(' ')) {
-        currentFileLine++;
-        
-        // Check if this is our target line
-        if (currentFileLine === targetLine) {
-          logger.debug(`Found target line ${targetLine} at diff position ${position}`);
-          return position;
-        }
-      }
-    }
-    
-    logger.warn(`Could not find line ${targetLine} in diff`);
-    return null;
-  }
-
-  async addComment(installationId, owner, repo, prNumber, body) {
-    try {
-      const client = await this.getApiClient(installationId);
-
-      const response = await client.post(
-        `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
-        { body }
-      );
-
-      return response.data;
-    } catch (error) {
-      logger.error("Error adding comment", {
-        error: error.message,
-        owner,
-        repo,
-        prNumber,
-      });
-      throw new Error(`Failed to add comment: ${error.message}`);
-    }
-  }
-
   async handleWebhook(event, payload) {
     logger.info(`Received GitHub webhook: ${event}`, {
       action: payload.action,
@@ -225,14 +282,12 @@ class GitHubService {
         break;
 
       case "pull_request_review":
-        // Handle PR review events if needed
         logger.info("Pull request review event received", {
           action: payload.action,
         });
         break;
 
       case "pull_request_review_comment":
-        // Handle PR review comment events if needed
         logger.info("Pull request review comment event received", {
           action: payload.action,
         });
@@ -404,62 +459,6 @@ class GitHubService {
         headSha,
       });
       throw new Error(`Failed to get commits: ${error.message}`);
-    }
-  }
-
-  async createReviewComment(installationId, owner, repo, prNumber, comment) {
-    try {
-      const client = await this.getApiClient(installationId);
-
-      const response = await client.post(
-        `/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
-        {
-          body: comment.body,
-          commit_id: comment.commit_id,
-          path: comment.path,
-          line: comment.line || comment.position,
-          side: comment.side || "RIGHT",
-        }
-      );
-
-      return response.data;
-    } catch (error) {
-      logger.error("Error creating review comment", {
-        error: error.message,
-        owner,
-        repo,
-        prNumber,
-      });
-      throw new Error(`Failed to create review comment: ${error.message}`);
-    }
-  }
-
-  async updatePullRequestReview(
-    installationId,
-    owner,
-    repo,
-    prNumber,
-    reviewId,
-    event
-  ) {
-    try {
-      const client = await this.getApiClient(installationId);
-
-      const response = await client.put(
-        `/repos/${owner}/${repo}/pulls/${prNumber}/reviews/${reviewId}/events`,
-        { event } // APPROVE, REQUEST_CHANGES, COMMENT
-      );
-
-      return response.data;
-    } catch (error) {
-      logger.error("Error updating pull request review", {
-        error: error.message,
-        owner,
-        repo,
-        prNumber,
-        reviewId,
-      });
-      throw new Error(`Failed to update review: ${error.message}`);
     }
   }
 }
