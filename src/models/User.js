@@ -1,85 +1,78 @@
-/**
- * User model
- * Stores user information and GitHub credentials
- */
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
 const UserSchema = new mongoose.Schema({
-  githubId: {
-    type: String,
-    required: true,
-    unique: true
-  },
-  username: {
-    type: String,
-    required: true
-  },
   email: {
     type: String,
+    required: true,
+    unique: true,
     trim: true,
     lowercase: true,
     match: [/^\S+@\S+\.\S+$/, 'Please provide a valid email address']
   },
-  accessToken: {
+  password: {
     type: String,
-    required: true
+    required: true,
+    select: false
+  },
+  name: {
+    type: String,
+    required: true,
+    trim: true
   },
   refreshToken: {
-    type: String
+    type: String,
+    select: false
   },
-  avatarUrl: String,
-  name: String,
   role: {
     type: String,
     enum: ['user', 'admin'],
     default: 'user'
   },
-  notificationPreferences: {
-    email: {
-      enabled: { type: Boolean, default: true },
-      address: String
-    },
-    slack: {
-      enabled: { type: Boolean, default: false },
-      webhook: String
-    }
-  },
   lastLogin: {
-    type: Date,
-    default: Date.now
+    type: Date
   }
 }, {
   timestamps: true,
   toJSON: {
-    transform: function(doc, ret) {
-      delete ret.accessToken;
+    transform: function (doc, ret) {
+      delete ret.password;
       delete ret.refreshToken;
       return ret;
     }
   }
 });
 
-// Update last login timestamp
-UserSchema.methods.updateLoginTimestamp = function() {
-  this.lastLogin = Date.now();
-  return this.save();
+UserSchema.statics.findByEmail = function(email) {
+  return this.findOne({ email: email.toLowerCase() });
 };
 
-// Find user by GitHub ID
-UserSchema.statics.findByGithubId = function(githubId) {
-  return this.findOne({ githubId });
-};
-
-// Update user tokens
-UserSchema.methods.updateTokens = function(accessToken, refreshToken) {
-  this.accessToken = accessToken;
-  if (refreshToken) {
-    this.refreshToken = refreshToken;
+UserSchema.methods.comparePassword = async function(candidatePassword) {
+  try {
+    const user = await mongoose.model('User').findById(this._id).select('+password');
+    if (!user || !user.password) return false;
+    return await bcrypt.compare(candidatePassword, user.password);
+  } catch (error) {
+    return false;
   }
+};
+
+UserSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+UserSchema.methods.updateRefreshToken = async function(token) {
+  this.refreshToken = token;
   return this.save();
 };
 
 const User = mongoose.model('User', UserSchema);
-
 module.exports = User;

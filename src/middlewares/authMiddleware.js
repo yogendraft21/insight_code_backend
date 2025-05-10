@@ -1,22 +1,13 @@
-/**
- * Authentication Middleware
- * Handles user authentication and verification
- */
-const authService = require('../services/authService');
 const User = require('../models/User');
 const logger = require('../utils/logger');
+const jwt = require('jsonwebtoken');
+const { jwt: jwtConfig } = require('../config/env');
 
-/**
- * Authenticate user from JWT token
- * @param {Object} req - Express request object
- * @param {Object} res - Express response object
- * @param {Function} next - Express next function
- */
 const authenticate = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     
-    if (!authHeader) {
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ error: 'Authentication required' });
     }
     
@@ -26,17 +17,17 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid authentication format' });
     }
     
-    // Verify token
-    const decoded = authService.verifyToken(token);
+    const decoded = jwt.verify(token, jwtConfig.secret);
     
-    // Find user
-    const user = await User.findById(decoded.id);
+    if (!decoded.userId) {
+      return res.status(401).json({ error: 'Invalid token format' });
+    }
+    
+    const user = await User.findById(decoded.userId);
     
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
     }
-    
-    // Add user to request
     req.user = user;
     next();
   } catch (error) {
@@ -54,12 +45,6 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-/**
- * Check if user has admin role
- * @param {Object} req - Express request object
- * @param {Object} res - Express response object
- * @param {Function} next - Express next function
- */
 const requireAdmin = (req, res, next) => {
   if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Admin access required' });
@@ -68,12 +53,6 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
-/**
- * Verify GitHub webhook signature
- * @param {Object} req - Express request object
- * @param {Object} res - Express response object
- * @param {Function} next - Express next function
- */
 const verifyWebhook = (req, res, next) => {
   try {
     const signature = req.headers['x-hub-signature-256'];

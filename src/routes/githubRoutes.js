@@ -1,38 +1,19 @@
-/**
- * GitHub Routes
- * Handles routes for GitHub operations
- */
 const express = require('express');
-const router = express.Router();
 const githubController = require('../controllers/githubController');
-const { authenticate, verifyWebhook } = require('../middlewares/authMiddleware');
+const { authenticate } = require('../middlewares/authMiddleware');
 
-/**
- * @route POST /github/webhook
- * @desc Handle GitHub webhook events
- * @access Public (secured by webhook signature)
- */
-router.post('/webhook', verifyWebhook, githubController.webhookHandler);
+const router = express.Router();
 
-/**
- * @route GET /github/repositories
- * @desc List repositories for current user
- * @access Private
- */
+// Public routes (no auth required)
+router.post('/webhook', githubController.webhookHandler);
+router.get('/callback', githubController.oauthCallback);
+router.get('/installation/callback', githubController.postInstallCallback);
+
+// Protected routes (auth required)
+router.post('/prepare-installation', authenticate, githubController.prepareInstallation);
+router.get('/installation', authenticate, githubController.checkInstallation);
 router.get('/repositories', authenticate, githubController.listRepositories);
-
-/**
- * @route GET /github/repositories/:owner/:repo/config
- * @desc Get repository configuration
- * @access Private
- */
 router.get('/repositories/:owner/:repo/config', authenticate, githubController.getRepositoryConfig);
-
-/**
- * @route PUT /github/repositories/:owner/:repo/config
- * @desc Update repository configuration
- * @access Private
- */
 router.put('/repositories/:owner/:repo/config', authenticate, githubController.updateRepositoryConfig);
 
 module.exports = router;

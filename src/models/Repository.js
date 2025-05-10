@@ -34,7 +34,7 @@ const RepositorySchema = new mongoose.Schema({
     },
     reviewThreshold: {
       type: Number,
-      default: 2 // Changes needed to trigger a review
+      default: 2
     },
     notifyOnOpen: {
       type: Boolean,
@@ -44,9 +44,9 @@ const RepositorySchema = new mongoose.Schema({
       type: Boolean,
       default: true
     },
-    codeOwners: [String], // List of users to be notified
-    excludedPaths: [String], // Paths to exclude from review
-    includedPaths: [String] // Paths to include in review (if empty, all paths are included)
+    codeOwners: [String],
+    excludedPaths: [String],
+    includedPaths: [String]
   },
   isActive: {
     type: Boolean,
@@ -76,29 +76,28 @@ const RepositorySchema = new mongoose.Schema({
 RepositorySchema.index({ owner: 1, name: 1 }, { unique: true });
 
 // Virtual for repository URL
-RepositorySchema.virtual('url').get(function() {
+RepositorySchema.virtual('url').get(function () {
   return `https://github.com/${this.fullName}`;
 });
 
 // Find repository by full name
-RepositorySchema.statics.findByFullName = function(fullName) {
+RepositorySchema.statics.findByFullName = function (fullName) {
   return this.findOne({ fullName });
 };
 
 // Update repository stats when a PR is opened
-RepositorySchema.methods.incrementPRCount = function() {
+RepositorySchema.methods.incrementPRCount = function () {
   this.stats.totalPRs += 1;
   this.stats.lastActivity = Date.now();
   return this.save();
 };
 
 // Update repository stats when a review is added
-RepositorySchema.methods.incrementReviewCount = function() {
+RepositorySchema.methods.incrementReviewCount = function () {
   this.stats.totalReviews += 1;
   this.stats.lastActivity = Date.now();
   return this.save();
 };
 
 const Repository = mongoose.model('Repository', RepositorySchema);
-
 module.exports = Repository;

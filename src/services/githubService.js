@@ -1,21 +1,15 @@
-/**
- * GitHub Service
- * Handles interactions with the GitHub API
- */
 const axios = require('axios');
 const NodeCache = require('node-cache');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { getInstallationToken } = require('../utils/githubAuth');
 const logger = require('../utils/logger');
-
-// Cache for installation tokens (5 min TTL)
+const Installation = require('../models/Installation');
 const tokenCache = new NodeCache({ stdTTL: 300 });
+const webhookHelper = require("../helpers/webhookHelper")
 
 class GitHubService {
-  /**
-   * Get authenticated GitHub API client for an installation
-   * @param {number} installationId - GitHub installation ID
-   * @returns {Object} Axios instance configured for GitHub API
-   */
+
   async getApiClient(installationId) {
     const token = await this.getToken(installationId);
     
@@ -29,33 +23,19 @@ class GitHubService {
     });
   }
 
-  /**
-   * Get installation token (with caching)
-   * @param {number} installationId - GitHub installation ID
-   * @returns {string} Installation access token
-   */
   async getToken(installationId) {
     const cacheKey = `token-${installationId}`;
     
-    // Check cache first
     let token = tokenCache.get(cacheKey);
     if (token) {
       return token;
     }
     
-    // Get new token
     token = await getInstallationToken(installationId);
     tokenCache.set(cacheKey, token);
     return token;
   }
 
-  /**
-   * Get repository details
-   * @param {number} installationId - GitHub installation ID
-   * @param {string} owner - Repository owner
-   * @param {string} repo - Repository name
-   * @returns {Object} Repository details
-   */
   async getRepository(installationId, owner, repo) {
     try {
       const client = await this.getApiClient(installationId);
@@ -69,14 +49,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Get pull request details
-   * @param {number} installationId - GitHub installation ID
-   * @param {string} owner - Repository owner
-   * @param {string} repo - Repository name
-   * @param {number} prNumber - Pull request number
-   * @returns {Object} Pull request details
-   */
   async getPullRequest(installationId, owner, repo, prNumber) {
     try {
       const client = await this.getApiClient(installationId);
@@ -90,14 +62,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Get pull request files
-   * @param {number} installationId - GitHub installation ID
-   * @param {string} owner - Repository owner
-   * @param {string} repo - Repository name
-   * @param {number} prNumber - Pull request number
-   * @returns {Array} List of files changed in the pull request
-   */
   async getPullRequestFiles(installationId, owner, repo, prNumber) {
     try {
       const client = await this.getApiClient(installationId);
@@ -111,15 +75,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Get file content
-   * @param {number} installationId - GitHub installation ID
-   * @param {string} owner - Repository owner
-   * @param {string} repo - Repository name
-   * @param {string} path - File path
-   * @param {string} ref - Git reference (branch, commit)
-   * @returns {string} File content
-   */
   async getFileContent(installationId, owner, repo, path, ref) {
     try {
       const client = await this.getApiClient(installationId);
@@ -128,7 +83,6 @@ class GitHubService {
         { params: { ref } }
       );
       
-      // Decode content from base64
       return Buffer.from(response.data.content, 'base64').toString('utf8');
     } catch (error) {
       logger.error('Error fetching file content', { 
@@ -138,16 +92,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Post a review comment on a pull request
-   * @param {number} installationId - GitHub installation ID
-   * @param {string} owner - Repository owner
-   * @param {string} repo - Repository name
-   * @param {number} prNumber - Pull request number
-   * @param {Array} comments - Review comments
-   * @param {string} commitId - Commit SHA
-   * @returns {Object} Review result
-   */
   async createReview(installationId, owner, repo, prNumber, comments, commitId) {
     try {
       const client = await this.getApiClient(installationId);
@@ -174,15 +118,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Add a summary comment to a pull request
-   * @param {number} installationId - GitHub installation ID
-   * @param {string} owner - Repository owner
-   * @param {string} repo - Repository name
-   * @param {number} prNumber - Pull request number
-   * @param {string} body - Comment body
-   * @returns {Object} Comment result
-   */
   async addComment(installationId, owner, repo, prNumber, body) {
     try {
       const client = await this.getApiClient(installationId);
@@ -198,6 +133,165 @@ class GitHubService {
         error: error.message, owner, repo, prNumber 
       });
       throw new Error(`Failed to add comment: ${error.message}`);
+    }
+  }
+
+  async handleWebhook(event, payload) {
+    logger.info(`Received GitHub webhook: ${event}`, { 
+      action: payload.action,
+      repository: payload.repository?.full_name
+    });
+    
+    switch (event) {
+      case 'installation':
+        await webhookHelper.handleInstallationEvent(payload);
+        break;
+        
+      case 'installation_repositories':
+        await webhookHelper.handleInstallationRepositoriesEvent(payload);
+        break;
+        
+      case 'pull_request':
+        await webhookHelper.handlePullRequestEvent(payload);
+        break;
+        
+      default:
+        logger.info(`Unhandled GitHub webhook event: ${event}`);
+    }
+  }
+
+  async prepareInstallation(userId) {
+    try {
+      const state = crypto.randomBytes(16).toString('hex');
+      
+      // Clean up ONLY expired pending installations
+      await Installation.deleteMany({ 
+        userId, 
+        status: 'pending',
+        expiresAt: { $lt: new Date() }
+      });
+      
+      // Create new pending installation
+      const pendingInstallation = await Installation.create({
+        userId,
+        state,
+        status: 'pending',
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000) // 15 minutes
+      });
+      
+      // Build OAuth URL with state
+      const clientId = process.env.GITHUB_CLIENT_ID;
+      const appUrl = process.env.APP_URL || 'http://localhost:4000';
+      const redirectUri = encodeURIComponent(`${appUrl}/api/github/callback`);
+      const scope = encodeURIComponent('read:user');
+      
+      const oauthUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&state=${state}&scope=${scope}`;
+      
+      logger.info(`Prepared OAuth installation for user: ${userId}`);
+      
+      return { 
+        success: true,
+        oauthUrl: oauthUrl
+      };
+    } catch (error) {
+      logger.error('Error preparing installation', { error: error.message });
+      return { success: false, error: error.message };
+    }
+  }
+
+  async handleOAuthCallback(code, state) {
+    try {
+      // Find installation by state
+      const pendingInstallation = await Installation.findOne({
+        state: state,
+        status: 'pending',
+        expiresAt: { $gt: new Date() }
+      });
+      
+      if (!pendingInstallation) {
+        throw new Error('Invalid or expired state');
+      }
+
+      // Exchange code for token
+      const tokenResponse = await axios.post('https://github.com/login/oauth/access_token', {
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        code: code
+      }, {
+        headers: { Accept: 'application/json' }
+      });
+
+      if (tokenResponse.data.error) {
+        throw new Error(tokenResponse.data.error_description || 'OAuth authentication failed');
+      }
+
+      const accessToken = tokenResponse.data.access_token;
+
+      // Get GitHub user info
+      const userResponse = await axios.get('https://api.github.com/user', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      // Update installation with GitHub user info
+      pendingInstallation.githubUsername = userResponse.data.login;
+      pendingInstallation.githubUserId = userResponse.data.id;
+      pendingInstallation.status = 'verified';
+      pendingInstallation.verifiedAt = new Date();
+      
+      // Remove expiresAt so it won't be auto-deleted
+      pendingInstallation.expiresAt = undefined;
+      
+      await pendingInstallation.save();
+
+      // Build GitHub App installation URL
+      const appSlug = process.env.GITHUB_APP_SLUG;
+      const installationUrl = `https://github.com/apps/${appSlug}/installations/new`;
+
+      logger.info(`OAuth verified for user: ${pendingInstallation.userId}, GitHub: ${userResponse.data.login}`);
+
+      return {
+        success: true,
+        installationUrl: installationUrl
+      };
+    } catch (error) {
+      logger.error('OAuth callback error', { error: error.message });
+      return { success: false, error: error.message };
+    }
+  }
+  
+  async verifyAndCompleteInstallation(installationId, state) {
+    try {
+      
+      let stateData;
+      try {
+        stateData = jwt.verify(state, process.env.JWT_SECRET);
+      } catch (error) {
+        logger.error('Invalid state token', { error: error.message });
+        return { success: false, error: 'Invalid or expired state parameter' };
+      }
+      const pendingInstallation = await Installation.findOne({
+        userId: stateData.userId,
+        state: state,
+        status: 'pending',
+        expiresAt: { $gt: new Date() }
+      });
+      
+      if (!pendingInstallation) {
+        return { success: false, error: 'No pending installation found or it has expired' };
+      }
+      
+      // Update the installation with GitHub data
+      pendingInstallation.installationId = installationId;
+      pendingInstallation.status = 'verified';
+      pendingInstallation.verifiedAt = new Date();
+      await pendingInstallation.save();
+      
+      logger.info(`Installation verified for user: ${stateData.userId}`);
+      
+      return { success: true };
+    } catch (error) {
+      logger.error('Error verifying installation', { error: error.message });
+      return { success: false, error: error.message };
     }
   }
 }

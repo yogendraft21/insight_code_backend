@@ -51,8 +51,8 @@ if (nodeEnv !== 'test') {
 }
 
 // Routes
-app.use('/auth', authRoutes);
-app.use('/github', githubRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/github', githubRoutes);
 app.use('/review', reviewRoutes);
 app.use('/notifications', notificationRoutes);
 

@@ -1,13 +1,10 @@
-/**
- * PullRequest model
- * Stores information about pull requests and their review status
- */
 const mongoose = require('mongoose');
 
 const PRReviewSchema = new mongoose.Schema({
   reviewId: {
     type: String,
-    required: true
+    required: true,
+    unique: true
   },
   status: {
     type: String,
@@ -77,14 +74,6 @@ const PullRequestSchema = new mongoose.Schema({
     required: true
   },
   lastCommitSha: String,
-  createdAt: {
-    type: Date,
-    required: true
-  },
-  updatedAt: {
-    type: Date,
-    required: true
-  },
   closedAt: Date,
   mergedAt: Date,
   labels: [String],
@@ -97,32 +86,30 @@ const PullRequestSchema = new mongoose.Schema({
     default: true
   }
 }, {
-  timestamps: true
+  timestamps: true // this manages createdAt and updatedAt automatically
 });
 
-// Create compound index for repository and PR number
+// Compound index for repositoryId + prNumber
 PullRequestSchema.index({ repositoryId: 1, prNumber: 1 }, { unique: true });
 
-// Add a new review
+// === Instance Methods ===
+
 PullRequestSchema.methods.addReview = function(reviewData) {
   this.reviews.push(reviewData);
   return this.save();
 };
 
-// Get the latest review
 PullRequestSchema.methods.getLatestReview = function() {
-  if (this.reviews.length === 0) return null;
-  return this.reviews.sort((a, b) => b.createdAt - a.createdAt)[0];
+  return this.reviews.sort((a, b) => b.createdAt - a.createdAt)[0] || null;
 };
 
-// Update pull request details
 PullRequestSchema.methods.updateDetails = function(details) {
   Object.assign(this, details);
-  this.updatedAt = Date.now();
   return this.save();
 };
 
-// Find by repository and PR number
+// === Static Methods ===
+
 PullRequestSchema.statics.findByRepoAndNumber = function(repositoryId, prNumber) {
   return this.findOne({ repositoryId, prNumber });
 };
