@@ -1,92 +1,61 @@
-// aiReviewService.js - Complete service with inline comments and re-review
+// aiReviewService.js - Enhanced with chunking for large PRs
 const PullRequest = require("../models/PullRequest");
 const Repository = require("../models/Repository");
 const githubService = require("./githubService");
 const openaiService = require("./openaiService");
 const logger = require("../utils/logger");
+const DiffAnalyzer = require("../helpers/diffAnalyzer");
+const ContextBuilder = require("../helpers/contextBuilder");
+const PromptBuilder = require("../helpers/promptBuilder");
+const CommentProcessor = require("../helpers/commentProcessor");
+const ReviewManager = require("../helpers/reviewManager");
 
 class AIReviewService {
+  constructor() {
+    this.diffAnalyzer = new DiffAnalyzer();
+    this.contextBuilder = new ContextBuilder();
+    this.promptBuilder = new PromptBuilder();
+    this.commentProcessor = new CommentProcessor();
+    this.reviewManager = new ReviewManager();
+  }
+
   async reviewPullRequest(pullRequestId, isReReview = false) {
     let reviewId;
 
     try {
-      const pullRequest = await PullRequest.findById(pullRequestId).populate(
-        "repositoryId"
+      // Load PR and repository
+      const { pullRequest, repository } = await this.loadPullRequest(
+        pullRequestId
       );
 
-      if (!pullRequest) {
-        throw new Error("Pull request not found");
-      }
-
-      const repository = pullRequest.repositoryId;
-
-      // Create review ID
-      const existingReviews = pullRequest.reviews || [];
-      const reviewCount = existingReviews.length;
-      reviewId = `review_${Date.now()}_${reviewCount + 1}`;
-
-      // For re-reviews, mark previous reviews as superseded
-      if (isReReview && existingReviews.length > 0) {
-        await this.markPreviousReviewsAsSuperseded(pullRequestId);
-      }
-
-      // Add new review with proper structure
-      await pullRequest.addReview({
-        reviewId,
-        status: "in_progress",
-        createdAt: new Date(),
-        isReReview,
-        reviewNumber: reviewCount + 1,
-      });
-
-      // Get PR diff and files
-      const prDiff = await this.getPullRequestDiff(
-        repository.installationId,
-        repository.owner,
-        repository.name,
-        pullRequest.prNumber
-      );
-
-      // Get repository context
-      const repoContext = await this.getRepositoryContext(
-        repository.installationId,
-        repository.owner,
-        repository.name,
-        pullRequest
-      );
-
-      // Analyze the PR with AI
-      const analysisResult = await this.analyzeWithAI(
-        prDiff,
-        repoContext,
+      // Initialize review
+      reviewId = await this.reviewManager.initializeReview(
         pullRequest,
         isReReview
       );
 
-      // Post comments on GitHub - wrap in try-catch to handle partial success
-      try {
-        await this.postReviewComments(
-          repository.installationId,
-          repository.owner,
-          repository.name,
-          pullRequest.prNumber,
-          analysisResult.comments,
-          pullRequest.lastCommitSha
+      // Get structured PR data
+      const prData = await this.collectPullRequestData(
+        repository,
+        pullRequest,
+        isReReview
+      );
+
+      // Check if we need to chunk the review
+      let analysis;
+      if (this.promptBuilder.needsChunking(prData)) {
+        logger.info("Large PR detected, using chunked review");
+        analysis = await this.analyzeWithChunking(
+          prData,
+          pullRequest,
+          isReReview
         );
-      } catch (commentError) {
-        logger.error("Error posting some comments, but continuing", {
-          error: commentError.message,
-        });
-        // Don't throw - we want to update the review status even if some comments failed
+      } else {
+        analysis = await this.analyzeWithAI(prData, pullRequest, isReReview);
       }
 
-      // Update review status to completed
-      await this.updateReviewStatus(
-        pullRequestId,
-        reviewId,
-        analysisResult,
-        "completed"
-      );
+      // Post comments and update review
+      await this.postResults(repository, pullRequest, reviewId, analysis);
 
       logger.info(
         `Review completed successfully for PR #${pullRequest.prNumber}`
@@ -95,472 +64,260 @@ class AIReviewService {
     } catch (error) {
       logger.error("Error in AI review", { error: error.message });
 
-      // Update review status to failed
       if (reviewId) {
-        try {
-          await this.updateReviewStatus(
-            pullRequestId,
-            reviewId,
-            null,
-            "failed",
-            error.message
-          );
-        } catch (updateError) {
-          logger.error("Error updating failed review status", {
-            error: updateError.message,
-          });
-        }
+        await this.reviewManager.markReviewFailed(
+          pullRequestId,
+          reviewId,
+          error.message
+        );
       }
 
       throw error;
     }
   }
 
-  async markPreviousReviewsAsSuperseded(pullRequestId) {
-    try {
-      await PullRequest.findByIdAndUpdate(pullRequestId, {
-        $set: {
-          "reviews.$[].isSuperseded": true,
-        },
-      });
-    } catch (error) {
-      logger.error("Error marking reviews as superseded", {
-        error: error.message,
-      });
+  async loadPullRequest(pullRequestId) {
+    const pullRequest = await PullRequest.findById(pullRequestId).populate(
+      "repositoryId"
+    );
+
+    if (!pullRequest) {
+      throw new Error("Pull request not found");
     }
+
+    return {
+      pullRequest,
+      repository: pullRequest.repositoryId,
+    };
   }
 
-  async getPullRequestDiff(installationId, owner, repo, prNumber) {
-    try {
-      const files = await githubService.getPullRequestFiles(
-        installationId,
-        owner,
-        repo,
-        prNumber
-      );
+  async collectPullRequestData(repository, pullRequest, isReReview) {
+    // Get PR diff and files
+    const prFiles = await githubService.getPullRequestFiles(
+      repository.installationId,
+      repository.owner,
+      repository.name,
+      pullRequest.prNumber
+    );
 
-      const processedFiles = files.map((file) => ({
-        filename: file.filename,
-        status: file.status,
-        additions: file.additions,
-        deletions: file.deletions,
-        changes: file.changes,
-        patch: file.patch,
-        previousFilename: file.previous_filename,
-      }));
+    // Analyze diff to get proper line mappings
+    const diffAnalysis = this.diffAnalyzer.analyzePRFiles(prFiles);
 
-      return {
-        files: processedFiles,
-        totalAdditions: files.reduce((sum, file) => sum + file.additions, 0),
-        totalDeletions: files.reduce((sum, file) => sum + file.deletions, 0),
-        totalChanges: files.reduce((sum, file) => sum + file.changes, 0),
-      };
-    } catch (error) {
-      logger.error("Error getting PR diff", { error: error.message });
-      throw error;
-    }
-  }
-
-  async getRepositoryContext(installationId, owner, repo, pullRequest) {
-    try {
-      const context = {
-        repositoryInfo: {},
-        relatedFiles: [],
-        projectStructure: [],
-        previousReviews: [],
-      };
-
-      // Get basic repository info
-      context.repositoryInfo = await githubService.getRepository(
-        installationId,
-        owner,
-        repo
-      );
-
-      // Get previous reviews for this PR
-      context.previousReviews = pullRequest.reviews.filter(
-        (review) => review.status === "completed" && !review.isSuperseded
-      );
-
-      return context;
-    } catch (error) {
-      logger.error("Error getting repository context", {
-        error: error.message,
-      });
-      throw error;
-    }
-  }
-
-  async analyzeWithAI(prDiff, repoContext, pullRequest, isReReview) {
-    try {
-      const prompt = this.buildAIPrompt(
-        prDiff,
-        repoContext,
-        pullRequest,
-        isReReview
-      );
-      const aiResponse = await openaiService.analyzeCode(prompt);
-      const parsedResponse = this.parseAIResponse(aiResponse);
-
-      return {
-        summary: parsedResponse.summary,
-        comments: parsedResponse.comments,
-        metrics: parsedResponse.metrics,
-        suggestions: parsedResponse.suggestions,
-      };
-    } catch (error) {
-      logger.error("Error in AI analysis", { error: error.message });
-      throw error;
-    }
-  }
-
-  buildAIPrompt(prDiff, repoContext, pullRequest, isReReview) {
-    // Start with basic PR information
-    let prompt = `
-You are a code reviewer analyzing a pull request.
-
-PULL REQUEST DETAILS:
-- Title: ${pullRequest.title}
-- Description: ${pullRequest.description || "No description"}
-- Type: ${
+    // Build context for the review
+    const context = await this.contextBuilder.buildContext(
+      repository,
+      pullRequest,
+      diffAnalysis,
       isReReview
-        ? "RE-REVIEW (check if previous issues were fixed)"
-        : "INITIAL REVIEW"
-    }
-- Repository: ${repoContext.repositoryInfo.full_name}
-- Language: ${repoContext.repositoryInfo.language || "Not specified"}
-`;
+    );
 
-    // Add previous review context for re-reviews
-    if (isReReview && repoContext.previousReviews.length > 0) {
-      const lastReview =
-        repoContext.previousReviews[repoContext.previousReviews.length - 1];
-      prompt += `\nPREVIOUS REVIEW:
-- Found ${lastReview.feedback.length} issues
-- Issues to verify:`;
+    return {
+      diffAnalysis,
+      context,
+      files: prFiles,
+    };
+  }
 
-      lastReview.feedback.forEach((fb, index) => {
-        prompt += `\n  ${index + 1}. ${fb.comment} (${fb.path}:${fb.line})`;
-      });
-    }
+  async analyzeWithAI(prData, pullRequest, isReReview) {
+    // Build optimized prompt
+    const prompt = this.promptBuilder.buildPrompt(
+      prData,
+      pullRequest,
+      isReReview
+    );
 
-    // Add file changes summary
-    prompt += `\n\nCHANGES SUMMARY:
-- Files changed: ${prDiff.files.length}
-- Lines added: ${prDiff.totalAdditions}
-- Lines removed: ${prDiff.totalDeletions}
-`;
+    // Get AI analysis
+    const aiResponse = await openaiService.analyzeCodeWithRetry(prompt);
 
-    // Add detailed file changes with diffs
-    prompt += `\nFILE CHANGES:`;
+    // Process and validate comments
+    const processedComments = this.commentProcessor.processComments(
+      aiResponse.comments,
+      prData.diffAnalysis
+    );
 
-    prDiff.files.forEach((file, index) => {
-      prompt += `\n\n${index + 1}. ${file.filename}`;
-      prompt += `\n   Status: ${file.status}`;
-      prompt += `\n   Changes: +${file.additions} -${file.deletions}`;
+    return {
+      summary: aiResponse.summary,
+      comments: processedComments,
+      metrics: aiResponse.metrics,
+      suggestions: aiResponse.suggestions,
+    };
+  }
 
-      if (file.patch) {
-        prompt += `\n   Diff:\n\`\`\`diff\n${file.patch}\n\`\`\``;
+  async analyzeWithChunking(prData, pullRequest, isReReview) {
+    const files = Object.entries(prData.diffAnalysis.files);
+    const totalChunks = Math.ceil(files.length / 5); // 5 files per chunk
+
+    logger.info(`Analyzing PR in ${totalChunks} chunks`);
+
+    const allComments = [];
+    const metricsList = [];
+    let overallSummary = "";
+
+    // Process each chunk
+    for (let i = 0; i < totalChunks; i++) {
+      logger.info(`Processing chunk ${i + 1}/${totalChunks}`);
+
+      try {
+        // Build chunk-specific prompt
+        const chunkPrompt = this.promptBuilder.buildChunkedPrompt(
+          prData,
+          pullRequest,
+          isReReview,
+          i,
+          totalChunks
+        );
+
+        // Analyze chunk
+        const chunkResponse = await openaiService.analyzeCodeWithRetry(
+          chunkPrompt
+        );
+
+        // Collect results
+        if (chunkResponse.comments) {
+          allComments.push(...chunkResponse.comments);
+        }
+
+        if (chunkResponse.metrics) {
+          metricsList.push(chunkResponse.metrics);
+        }
+
+        if (chunkResponse.summary) {
+          overallSummary += `\nChunk ${i + 1}: ${chunkResponse.summary}`;
+        }
+      } catch (error) {
+        logger.error(`Error analyzing chunk ${i + 1}`, {
+          error: error.message,
+        });
+        // Continue with other chunks
       }
+    }
+
+    // Combine results
+    const combinedMetrics = this.combineMetrics(metricsList);
+    const processedComments = this.commentProcessor.processComments(
+      allComments,
+      prData.diffAnalysis
+    );
+
+    return {
+      summary: this.generateCombinedSummary(overallSummary, processedComments),
+      comments: processedComments,
+      metrics: combinedMetrics,
+      suggestions: [],
+    };
+  }
+
+  combineMetrics(metricsList) {
+    if (metricsList.length === 0) {
+      return {
+        readability: 5,
+        maintainability: 5,
+        security: 5,
+        performance: 5,
+        testCoverage: 5,
+        architecturalQuality: 5,
+      };
+    }
+
+    // Average all metrics
+    const combined = {};
+    const metricKeys = Object.keys(metricsList[0]);
+
+    metricKeys.forEach((key) => {
+      const values = metricsList
+        .map((m) => m[key] || 5)
+        .filter((v) => !isNaN(v));
+      combined[key] = Math.round(
+        values.reduce((a, b) => a + b, 0) / values.length
+      );
     });
 
-    // Add review instructions
-    prompt += `\n\nREVIEW INSTRUCTIONS:
-
-ONLY REPORT THESE ISSUES:
-1. console.log statements - MUST be removed
-2. ONLY comment on ACTUAL unused code - if you see it being used, don't comment
-3. Missing error handling - MUST be added
-4. Security vulnerabilities - MUST be fixed
-5. Memory leaks - MUST be fixed
-
-DO NOT COMMENT ON:
-- Quote styles (' vs ")
-- Code formatting
-- Variable naming
-- Code organization
-- "Improvements" or "refactoring"
-
-HOW TO READ DIFFS:
-- Lines starting with @@ show line numbers
-- Lines starting with + are additions (review these)
-- Lines starting with - are deletions (ignore these)
-- Example: "@@ -29,7 +32,10 @@" means new code starts at line 32
-
-RESPONSE FORMAT:
-{
-  "summary": "Found X critical issues",
-  "comments": [
-    {
-      "file": "exact/path/from/diff",
-      "line": <exact line number>,
-      "type": "issue",
-      "severity": "high|medium|low",
-      "comment": "Direct instruction (see examples below)"
-    }
-  ],
-  "metrics": {
-    "readability": 8,
-    "maintainability": 7,
-    "security": 9,
-    "performance": 8
-  },
-  "suggestions": []
-}
-
-EXAMPLE COMMENTS:
-
-For console.log:
-{
-  "file": "src/components/Button.js",
-  "line": 45,
-  "type": "issue",
-  "severity": "high",
-  "comment": "Remove console.log statement (line 45)"
-}
-
-For unused code:
-{
-  "file": "src/utils/helpers.js",
-  "line": 32,
-  "type": "issue",
-  "severity": "medium",
-  "comment": "Remove unused function 'factorial' (line 32)"
-}
-
-For missing error handling:
-{
-  "file": "src/api/client.js",
-  "line": 67,
-  "type": "issue",
-  "severity": "high",
-  "comment": "Add error handling for API call (line 67)\\nCurrent: \`const data = await fetch(url);\`\\nFix: \`try { const data = await fetch(url); } catch (error) { console.error(error); throw error; }\`"
-}
-
-IMPORTANT:
-- Use EXACT line numbers from the diff
-- Be specific and direct
-- Include code examples only for complex fixes
-- Every comment MUST have a line number`;
-
-    return prompt;
+    return combined;
   }
 
-  parseAIResponse(aiResponse) {
-    try {
-      if (typeof aiResponse === "object") {
-        return aiResponse;
-      }
+  generateCombinedSummary(chunkSummaries, comments) {
+    const issueCount = comments.filter((c) => c.type === "issue").length;
+    const criticalCount = comments.filter(
+      (c) => c.severity === "critical"
+    ).length;
 
-      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-
-      return {
-        summary: "Failed to parse AI response",
-        comments: [],
-        metrics: {
-          readability: 5,
-          maintainability: 5,
-          security: 5,
-          performance: 5,
-        },
-        suggestions: [],
-      };
-    } catch (error) {
-      logger.error("Error parsing AI response", { error: error.message });
-      return {
-        summary: "Error parsing response",
-        comments: [],
-        metrics: {},
-        suggestions: [],
-      };
+    let summary = `Found ${issueCount} issues`;
+    if (criticalCount > 0) {
+      summary += ` (${criticalCount} critical)`;
     }
+
+    if (chunkSummaries) {
+      summary += ". " + chunkSummaries.trim();
+    }
+
+    return summary;
   }
 
-  async postReviewComments(
-    installationId,
-    owner,
-    repo,
-    prNumber,
-    comments,
-    commitSha
-  ) {
+  async postResults(repository, pullRequest, reviewId, analysis) {
+    // Post comments to GitHub
+    const commentResults = await this.postReviewComments(
+      repository,
+      pullRequest,
+      analysis.comments
+    );
+
+    // Update review status
+    await this.reviewManager.updateReviewStatus(
+      pullRequest._id,
+      reviewId,
+      analysis,
+      commentResults
+    );
+  }
+
+  async postReviewComments(repository, pullRequest, comments) {
     try {
-      if (!comments || comments.length === 0) {
-        logger.info("No comments to post");
-        return;
+      // Separate inline and general comments
+      const { inlineComments, generalComments } =
+        this.commentProcessor.separateComments(comments);
+
+      // Post inline comments
+      let inlineResults = { success: 0, failed: 0 };
+      if (inlineComments.length > 0) {
+        inlineResults = await githubService.createReviewWithComments(
+          repository.installationId,
+          repository.owner,
+          repository.name,
+          pullRequest.prNumber,
+          inlineComments,
+          pullRequest.lastCommitSha
+        );
       }
 
-      // Filter and validate comments
-      const validComments = comments
-        .filter((comment) => comment && comment.file && comment.line > 0)
-        .map((comment) => ({
-          path: comment.file,
-          line: parseInt(comment.line),
-          body: `**${comment.type ? comment.type.toUpperCase() : "COMMENT"}** ${
-            comment.severity ? `(${comment.severity})` : ""
-          }: ${comment.comment || ""}`,
-        }));
-
-      logger.info(`Posting ${validComments.length} inline comments`);
-
-      if (validComments.length > 0) {
+      // Post general comments
+      let generalResults = { success: 0, failed: 0 };
+      for (const comment of generalComments) {
         try {
-          await githubService.createReview(
-            installationId,
-            owner,
-            repo,
-            prNumber,
-            validComments,
-            commitSha
+          await githubService.addComment(
+            repository.installationId,
+            repository.owner,
+            repository.name,
+            pullRequest.prNumber,
+            comment.body
           );
+          generalResults.success++;
         } catch (error) {
-          logger.error("Failed to create review with inline comments", {
+          logger.error("Failed to post general comment", {
             error: error.message,
           });
-
-          // Fallback: post as regular comments
-          for (const comment of validComments) {
-            await githubService.addComment(
-              installationId,
-              owner,
-              repo,
-              prNumber,
-              `**${comment.path}** (Line ${comment.line})\n${comment.body}`
-            );
-          }
+          generalResults.failed++;
         }
       }
 
-      // Handle general comments
-      const generalComments = comments.filter(
-        (comment) => !comment.file || !comment.line || comment.line <= 0
-      );
-
-      for (const comment of generalComments) {
-        if (comment && comment.comment) {
-          await githubService.addComment(
-            installationId,
-            owner,
-            repo,
-            prNumber,
-            `**${comment.type ? comment.type.toUpperCase() : "COMMENT"}**: ${
-              comment.comment
-            }`
-          );
-        }
-      }
+      return {
+        inline: inlineResults,
+        general: generalResults,
+        totalSuccess: inlineResults.success + generalResults.success,
+        totalFailed: inlineResults.failed + generalResults.failed,
+      };
     } catch (error) {
       logger.error("Error posting review comments", { error: error.message });
       throw error;
-    }
-  }
-
-  async updateReviewStatus(
-    pullRequestId,
-    reviewId,
-    analysisResult,
-    status = "completed",
-    errorMessage = null
-  ) {
-    try {
-      const pullRequest = await PullRequest.findById(pullRequestId);
-
-      const reviewIndex = pullRequest.reviews.findIndex(
-        (r) => r.reviewId === reviewId
-      );
-
-      if (reviewIndex === -1) {
-        throw new Error("Review not found");
-      }
-
-      // Ensure all required fields are present
-      const updatedReview = {
-        reviewId: reviewId,
-        status: status,
-        createdAt: pullRequest.reviews[reviewIndex].createdAt, // Keep existing created date
-        completedAt:
-          status === "completed"
-            ? new Date()
-            : pullRequest.reviews[reviewIndex].completedAt,
-        error: errorMessage,
-        feedback: [],
-        summary: "",
-        metrics: {
-          codeQualityScore: 5,
-          readability: 5,
-          maintainability: 5,
-          securityScore: 5,
-          complexity: 5,
-        },
-      };
-
-      // Add analysis results if available and status is completed
-      if (status === "completed" && analysisResult) {
-        updatedReview.summary = analysisResult.summary || "AI review completed";
-
-        // Map feedback with proper type validation
-        updatedReview.feedback = (analysisResult.comments || []).map(
-          (comment) => {
-            // Map AI types to allowed schema types
-            let validType = "suggestion"; // default
-            if (comment.type) {
-              const typeMap = {
-                improvement: "suggestion",
-                issue: "issue",
-                bug: "issue",
-                error: "issue",
-                praise: "praise",
-                suggestion: "suggestion",
-                question: "question",
-              };
-              validType = typeMap[comment.type.toLowerCase()] || "suggestion";
-            }
-
-            return {
-              path: comment.file || "",
-              line: parseInt(comment.line) || 0,
-              comment: comment.comment || "",
-              type: validType,
-              severity: comment.severity || "medium",
-            };
-          }
-        );
-
-        // Update metrics
-        if (analysisResult.metrics) {
-          updatedReview.metrics = {
-            codeQualityScore:
-              Math.round(
-                (analysisResult.metrics.readability +
-                  analysisResult.metrics.maintainability +
-                  analysisResult.metrics.security +
-                  analysisResult.metrics.performance) /
-                  4
-              ) || 5,
-            readability: analysisResult.metrics.readability || 5,
-            maintainability: analysisResult.metrics.maintainability || 5,
-            securityScore: analysisResult.metrics.security || 5,
-            complexity: analysisResult.metrics.performance || 5,
-          };
-        }
-      }
-
-      // Replace the entire review object to avoid validation issues
-      pullRequest.reviews[reviewIndex] = updatedReview;
-
-      await pullRequest.save();
-      logger.info(
-        `Review status updated to ${status} for reviewId: ${reviewId}`
-      );
-    } catch (error) {
-      logger.error("Error updating review status", {
-        error: error.message,
-        stack: error.stack,
-      });
-      // Don't re-throw to prevent cascade failures
     }
   }
 }
