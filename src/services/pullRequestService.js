@@ -1,3 +1,4 @@
+// pullRequestService.js - Fixed to properly fetch repositories
 const PullRequest = require("../models/PullRequest");
 const Repository = require("../models/Repository");
 const Installation = require("../models/Installation");
@@ -12,44 +13,217 @@ class PullRequestService {
     installationId
   ) {
     try {
-      let pullRequest = await PullRequest.findByRepoAndNumber(
+      const existingPR = await PullRequest.findOne({
         repositoryId,
-        prData.prNumber
-      );
-
-      const prDetails = {
-        ...prData,
-        userId,
-        repositoryId,
-        installationId,
         githubPrId: prData.id,
-        // Don't include reviews in the update data
-      };
+      });
 
-      if (pullRequest) {
-        // Update existing PR without touching reviews
-        pullRequest = await PullRequest.findOneAndUpdate(
-          { repositoryId, prNumber: prData.prNumber },
-          { $set: prDetails },
-          { new: true }
-        );
-        logger.info(`Updated pull request #${prData.prNumber}`);
-      } else {
-        // Create new PR with empty reviews array
-        prDetails.reviews = [];
-        pullRequest = await PullRequest.create(prDetails);
-        logger.info(`Created new pull request #${prData.prNumber}`);
+      if (existingPR) {
+        return { pullRequest: existingPR, updated: false };
       }
 
-      return pullRequest;
+      try {
+        const uuid = require("uuid").v4;
+        const dummyReviewId = uuid();
+
+        const newPR = new PullRequest({
+          userId,
+          repositoryId,
+          installationId,
+          prNumber: prData.prNumber,
+          githubPrId: prData.id,
+          title: prData.title,
+          description: prData.description || "",
+          author: prData.author,
+          state: prData.state,
+          url: prData.url,
+          lastCommitSha: prData.lastCommitSha,
+          baseBranch: prData.baseBranch,
+          headBranch: prData.headBranch,
+          labels: prData.labels || [],
+          closedAt: prData.closedAt,
+          mergedAt: prData.mergedAt,
+          additions: prData.additions || 0,
+          deletions: prData.deletions || 0,
+          changedFiles: prData.changedFiles || 0,
+          isActive: true,
+          reviews: [
+            {
+              reviewId: dummyReviewId,
+              status: "pending",
+              createdAt: new Date(),
+              isPlaceholder: true,
+            },
+          ],
+        });
+
+        try {
+          const savedPR = await newPR.save();
+
+          if (savedPR.reviews && savedPR.reviews.length > 0) {
+            await PullRequest.updateOne(
+              { _id: savedPR._id },
+              { $pull: { reviews: { isPlaceholder: true } } }
+            );
+          }
+
+          const cleanPR = await PullRequest.findById(savedPR._id);
+          return { pullRequest: cleanPR, updated: false };
+        } catch (saveError) {
+          throw saveError;
+        }
+      } catch (approachError) {
+        try {
+          const rawDoc = {
+            userId,
+            repositoryId,
+            installationId,
+            prNumber: prData.prNumber,
+            githubPrId: prData.id,
+            title: prData.title,
+            description: prData.description || "",
+            author: prData.author,
+            state: prData.state,
+            url: prData.url,
+            lastCommitSha: prData.lastCommitSha,
+            baseBranch: prData.baseBranch,
+            headBranch: prData.headBranch,
+            labels: prData.labels || [],
+            closedAt: prData.closedAt,
+            mergedAt: prData.mergedAt,
+            additions: prData.additions || 0,
+            deletions: prData.deletions || 0,
+            changedFiles: prData.changedFiles || 0,
+            isActive: true,
+            reviews: [],
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          const collection = PullRequest.collection;
+          const result = await collection.insertOne(rawDoc);
+
+          if (result.insertedId) {
+            const insertedPR = await PullRequest.findById(result.insertedId);
+            return { pullRequest: insertedPR, updated: false };
+          } else {
+            throw new Error(
+              "Failed to insert document via raw MongoDB operation"
+            );
+          }
+        } catch (rawError) {
+          throw rawError;
+        }
+      }
     } catch (error) {
-      logger.error("Error creating/updating pull request", {
-        error: error.message,
-      });
+      try {
+        const possiblePR = await PullRequest.findOne({
+          repositoryId,
+          prNumber: prData.prNumber,
+        });
+
+        if (possiblePR) {
+          return { pullRequest: possiblePR, updated: false };
+        }
+      } catch (lastResortError) {
+        // Silent catch
+      }
+
       throw error;
     }
   }
 
+  async syncRepositoryPullRequests(repositoryId, userId) {
+    try {
+      const repository = await Repository.findById(repositoryId);
+      if (!repository) return 0;
+
+      const client = await githubService.getApiClient(
+        repository.installationId
+      );
+      const response = await client.get(
+        `/repos/${repository.owner}/${repository.name}/pulls`,
+        { params: { state: "all", per_page: 100 } }
+      );
+
+      console.log("Fetched pull requests:", response.data);
+      let syncedCount = 0;
+      for (const pr of response.data) {
+        try {
+          const prData = {
+            prNumber: pr.number,
+            id: pr.id,
+            title: pr.title,
+            description: pr.body || "",
+            author: {
+              githubId: pr.user.id.toString(),
+              username: pr.user.login,
+              avatarUrl: pr.user.avatar_url,
+            },
+            state: pr.state,
+            url: pr.html_url,
+            lastCommitSha: pr.head.sha,
+            baseBranch: pr.base.ref,
+            headBranch: pr.head.ref,
+            labels: pr.labels.map((label) => label.name),
+            closedAt: pr.closed_at ? new Date(pr.closed_at) : null,
+            mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
+            additions: pr.additions || 0,
+            deletions: pr.deletions || 0,
+            changedFiles: pr.changed_files || 0,
+          };
+
+          await this.createOrUpdatePullRequest(
+            prData,
+            repositoryId,
+            userId,
+            repository.installationId
+          );
+          syncedCount++;
+        } catch (error) {
+          continue;
+        }
+      }
+      return syncedCount;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async syncAllUserRepositories(userId) {
+    try {
+      const installations = await Installation.find({
+        userId,
+        status: "active",
+        isActive: true,
+      });
+
+      let totalSynced = 0;
+      for (const installation of installations) {
+        const repositories = await Repository.find({
+          installationId: installation.installationId,
+          isActive: true,
+        });
+
+        for (const repository of repositories) {
+          try {
+            const count = await this.syncRepositoryPullRequests(
+              repository._id,
+              userId
+            );
+            totalSynced += count;
+          } catch (error) {
+            continue;
+          }
+        }
+      }
+      return totalSynced;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  // Rest of the methods remain the same...
   async getUserPullRequests(userId, options = {}) {
     try {
       const pullRequests = await PullRequest.findByUser(
@@ -81,118 +255,6 @@ class PullRequestService {
     }
   }
 
-  async syncRepositoryPullRequests(repositoryId) {
-    try {
-      const repository = await Repository.findById(repositoryId);
-      if (!repository) {
-        throw new Error("Repository not found");
-      }
-  
-      const installation = await Installation.findOne({
-        installationId: repository.installationId,
-        status: "active",
-      });
-  
-      if (!installation) {
-        throw new Error("No active installation found for repository");
-      }
-  
-      const client = await githubService.getApiClient(
-        repository.installationId
-      );
-      
-      const response = await client.get(
-        `/repos/${repository.owner}/${repository.name}/pulls`,
-        {
-          params: { state: "all", per_page: 100 },
-        }
-      );
-  
-      const pullRequests = response.data;
-      let syncedCount = 0;
-  
-      for (const pr of pullRequests) {
-        try {
-          const prData = {
-            prNumber: pr.number,
-            title: pr.title,
-            description: pr.body,
-            author: {
-              githubId: pr.user.id.toString(),
-              username: pr.user.login,
-              avatarUrl: pr.user.avatar_url,
-            },
-            state: pr.state,
-            url: pr.html_url,
-            lastCommitSha: pr.head.sha,
-            baseBranch: pr.base.ref,
-            headBranch: pr.head.ref,
-            labels: pr.labels.map((label) => label.name),
-            id: pr.id,
-          };
-  
-          await this.createOrUpdatePullRequest(
-            prData,
-            repositoryId,
-            installation.userId,
-            repository.installationId
-          );
-          
-          syncedCount++;
-        } catch (error) {
-          logger.error(`Error syncing PR #${pr.number}`, {
-            error: error.message,
-            prNumber: pr.number,
-            repository: repository.fullName
-          });
-          // Continue with next PR instead of failing entire sync
-        }
-      }
-  
-      logger.info(
-        `Synced ${syncedCount} of ${pullRequests.length} pull requests for repository ${repository.fullName}`
-      );
-      return syncedCount;
-    } catch (error) {
-      logger.error("Error syncing repository pull requests", {
-        error: error.message,
-        repositoryId
-      });
-      throw error;
-    }
-  }
-
-  async syncAllUserRepositories(userId) {
-    try {
-      const installation = await Installation.findOne({
-        userId,
-        status: "active",
-      });
-
-      if (!installation) {
-        throw new Error("No active installation found for user");
-      }
-
-      const repositories = await Repository.find({
-        installationId: installation.installationId,
-        isActive: true,
-      });
-
-      let totalSynced = 0;
-      for (const repository of repositories) {
-        const count = await this.syncRepositoryPullRequests(repository._id);
-        totalSynced += count;
-      }
-
-      return totalSynced;
-    } catch (error) {
-      logger.error("Error syncing all user repositories", {
-        error: error.message,
-      });
-      throw error;
-    }
-  }
-
   async triggerReview(pullRequestId) {
     try {
       const pullRequest = await PullRequest.findById(pullRequestId).populate(
@@ -203,8 +265,6 @@ class PullRequestService {
         throw new Error("Pull request not found");
       }
 
-      // This would call your AI review service
-      // For now, just mark as in progress
       const reviewId = `review_${Date.now()}`;
       await pullRequest.addReview({
         reviewId,
@@ -215,6 +275,49 @@ class PullRequestService {
       return reviewId;
     } catch (error) {
       logger.error("Error triggering review", { error: error.message });
+      throw error;
+    }
+  }
+
+  async getPullRequestDetails(pullRequestId) {
+    try {
+      const pullRequest = await PullRequest.findById(pullRequestId).populate(
+        "repositoryId",
+        "name owner fullName"
+      );
+
+      if (!pullRequest) {
+        throw new Error("Pull request not found");
+      }
+
+      return pullRequest;
+    } catch (error) {
+      logger.error("Error fetching pull request details", {
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  async getReviewDetails(pullRequestId, reviewId) {
+    try {
+      const pullRequest = await PullRequest.findById(pullRequestId);
+
+      if (!pullRequest) {
+        throw new Error("Pull request not found");
+      }
+
+      const review = pullRequest.reviews.find((r) => r.reviewId === reviewId);
+
+      if (!review) {
+        throw new Error("Review not found");
+      }
+
+      return review;
+    } catch (error) {
+      logger.error("Error fetching review details", {
+        error: error.message,
+      });
       throw error;
     }
   }

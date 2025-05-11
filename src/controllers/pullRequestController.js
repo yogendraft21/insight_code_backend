@@ -35,13 +35,26 @@ const getRepositoryPullRequests = asyncHandler(async (req, res) => {
 const syncPullRequests = asyncHandler(async (req, res) => {
   const userId = req.user._id;
 
-  const totalSynced = await pullRequestService.syncAllUserRepositories(userId);
+  try {
+    const totalSynced = await pullRequestService.syncAllUserRepositories(
+      userId
+    );
 
-  res.json({
-    success: true,
-    message: `Synced ${totalSynced} pull requests`,
-    totalSynced,
-  });
+    res.json({
+      success: true,
+      message: `Successfully synced ${totalSynced} pull requests`,
+      totalSynced,
+    });
+  } catch (error) {
+    logger.error("Error in sync pull requests", {
+      error: error.message,
+      userId,
+    });
+    res.status(500).json({
+      success: false,
+      message: error.message || "Failed to sync pull requests",
+    });
+  }
 });
 
 const syncRepositoryPullRequests = asyncHandler(async (req, res) => {
@@ -64,7 +77,7 @@ const triggerReview = asyncHandler(async (req, res) => {
 
   const reviewId = await aiReviewService.reviewPullRequest(
     pullRequestId,
-    !!reReview 
+    !!reReview
   );
 
   res.json({

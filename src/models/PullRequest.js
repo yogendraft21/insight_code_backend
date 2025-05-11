@@ -1,48 +1,49 @@
 const mongoose = require("mongoose");
 
-const PRReviewSchema = new mongoose.Schema({
-  reviewId: {
-    type: String,
-    required: true,
-    // Remove unique: true from here since it's in an array
-  },
-  status: {
-    type: String,
-    enum: ["pending", "in_progress", "completed", "failed"],
-    default: "pending",
-  },
-  summary: String,
-  feedback: [
-    {
-      path: String,
-      line: Number,
-      comment: String,
-      type: {
-        type: String,
-        enum: ["suggestion", "issue", "praise", "question"],
-        default: "suggestion",
-      },
-      severity: {
-        type: String,
-        enum: ["low", "medium", "high"],
-        default: "medium",
-      },
+const PRReviewSchema = new mongoose.Schema(
+  {
+    reviewId: {
+      type: String,
     },
-  ],
-  metrics: {
-    codeQualityScore: Number,
-    complexity: Number,
-    readability: Number,
-    maintainability: Number,
-    securityScore: Number,
+    status: {
+      type: String,
+      enum: ["pending", "in_progress", "completed", "failed"],
+      default: "pending",
+    },
+    summary: String,
+    feedback: [
+      {
+        path: String,
+        line: Number,
+        comment: String,
+        type: {
+          type: String,
+          enum: ["suggestion", "issue", "praise", "question"],
+          default: "suggestion",
+        },
+        severity: {
+          type: String,
+          enum: ["low", "medium", "high"],
+          default: "medium",
+        },
+      },
+    ],
+    metrics: {
+      codeQualityScore: Number,
+      complexity: Number,
+      readability: Number,
+      maintainability: Number,
+      securityScore: Number,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+    completedAt: Date,
+    error: String,
   },
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
-  completedAt: Date,
-  error: String,
-});
+  { _id: false }
+);
 
 const PullRequestSchema = new mongoose.Schema(
   {
@@ -98,7 +99,6 @@ const PullRequestSchema = new mongoose.Schema(
     changedFiles: Number,
     reviews: {
       type: [PRReviewSchema],
-      default: [], // Explicitly set default to empty array
     },
     isActive: {
       type: Boolean,
@@ -107,20 +107,17 @@ const PullRequestSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
+    autoIndex: false,
   }
 );
 
-// Indexes
+// Only create the indexes we actually need
 PullRequestSchema.index({ repositoryId: 1, prNumber: 1 }, { unique: true });
 PullRequestSchema.index({ userId: 1, state: 1 });
 PullRequestSchema.index({ githubPrId: 1 });
 
-// Remove the problematic unique index on nested reviewId
-// Instead, we'll ensure uniqueness at the application level
-
-// Instance Methods
+// Instance methods...
 PullRequestSchema.methods.addReview = function (reviewData) {
-  // Check if review with this ID already exists
   const existingReview = this.reviews.find(
     (r) => r.reviewId === reviewData.reviewId
   );
@@ -137,11 +134,12 @@ PullRequestSchema.methods.getLatestReview = function () {
 };
 
 PullRequestSchema.methods.updateDetails = function (details) {
-  Object.assign(this, details);
+  const { reviews, ...updateData } = details;
+  Object.assign(this, updateData);
   return this.save();
 };
 
-// Static Methods
+// Static methods...
 PullRequestSchema.statics.findByRepoAndNumber = function (
   repositoryId,
   prNumber
