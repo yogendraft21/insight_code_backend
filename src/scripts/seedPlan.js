@@ -6,7 +6,7 @@ require('dotenv').config();
 
 async function seedPlans() {
   try {
-    await mongoose.connect('mongodb://localhost:27017/github-pr-reviewer');
+    await mongoose.connect('mongodb+srv://yogendra:yogendra@cluster0.r2gbftx.mongodb.net/github-pr-reviewer');
     console.log('Connected to MongoDB');
 
     // Clear existing data
