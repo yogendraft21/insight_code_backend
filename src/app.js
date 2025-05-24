@@ -1,7 +1,3 @@
-/**
- * Main Application
- * Sets up Express server with middleware and routes
- */
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -17,12 +13,18 @@ const githubRoutes = require('./routes/githubRoutes');
 const reviewRoutes = require('./routes/reviewRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const pullRequestRoutes = require('./routes/pullRequestRoutes');
+const subscriptionRoutes = require('./routes/subscription.routes');
+const creditRoutes = require('./routes/credit.routes');
+const billingRoutes = require('./routes/billing.routes');
 
 // Create Express app
 const app = express();
 
 // Apply security headers
 app.use(helmet());
+
+// Special handling for Stripe webhooks (raw body) - MUST be before express.json()
+app.use('/api/subscription/webhook', express.raw({ type: 'application/json' }));
 
 // Parse JSON request body
 app.use(express.json({ limit: '1mb' }));
@@ -35,13 +37,28 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => {
-    // Skip rate limiting for webhook endpoint
-    return req.path === '/github/webhook';
+    // Skip rate limiting for webhook endpoints
+    return req.path === '/github/webhook' || req.path === '/api/subscription/webhook';
   }
 });
 app.use(limiter);
 
-// Enable CORS
+// const corsOptions = {
+//   origin: 'https://insight-code-lqy4srdea-yogendra311s-projects.vercel.app', // ✅ allow your frontend origin explicitly
+//   credentials: true,
+//   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+//   allowedHeaders: [
+//     'Content-Type',
+//     'Authorization',
+//     'X-Requested-With',
+//     'Accept',
+//     'Origin'
+//   ],
+//   optionsSuccessStatus: 200  // ✅ prevents hanging in some environments
+// };
+
+// app.use(cors(corsOptions));
+
 app.use(cors());
 
 // HTTP request logging
@@ -54,9 +71,14 @@ if (nodeEnv !== 'test') {
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/github', githubRoutes);
-app.use('/review', reviewRoutes);
-app.use('/notifications', notificationRoutes);
+app.use('/api/review', reviewRoutes);
+app.use('/api/notifications', notificationRoutes);
 app.use('/api/pull-requests', pullRequestRoutes);
+
+// New subscription routes
+app.use('/api/subscription', subscriptionRoutes);
+app.use('/api/credits', creditRoutes);
+app.use('/api/billing', billingRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
